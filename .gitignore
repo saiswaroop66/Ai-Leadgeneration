@@ -1,0 +1,29 @@
+
+# API keys and credentials
+.env
+credentials.json
+token.json
+secrets.toml
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local data and lead records
+leads.json
+leads.csv
+data/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

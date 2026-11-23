@@ -1,295 +1,237 @@
 
-import base64
-import re
+import os
 import json
+import re
 from pathlib import Path
-from email.utils import getaddresses
 
 import streamlit as st
 
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
-# --------------------------------------------------
-# FILE PATHS AND GMAIL SETTINGS
-# --------------------------------------------------
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 TOKEN_FILE = BASE_DIR / "token.json"
-
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly"
-]
+CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 
 
-# --------------------------------------------------
-# CONNECT TO GMAIL
-# --------------------------------------------------
+def get_gmail_service():
+    """Connect to Gmail using Streamlit Cloud secrets or local OAuth files."""
 
-def connect_gmail():
+    creds = None
 
-    credentials = None
-
-    # 1. Check Streamlit Cloud Secrets
+    # 1. Try Streamlit Cloud token secret
     try:
-        token_json = st.secrets.get(
-            "GMAIL_TOKEN_JSON",
-            None
-        )
-    except Exception:
-        token_json = None
+        token_json = st.secrets.get("GMAIL_TOKEN_JSON", None)
 
-    # 2. Load token from Streamlit Secrets
-    if token_json:
+        if token_json:
+            if isinstance(token_json, str):
+                token_info = json.loads(token_json)
+            else:
+                token_info = dict(token_json)
 
-        try:
-
-            token_info = json.loads(token_json)
-
-            credentials = Credentials.from_authorized_user_info(
+            creds = Credentials.from_authorized_user_info(
                 token_info,
                 SCOPES
             )
+    except Exception as e:
+        print("Could not load Gmail token from Streamlit secrets:", e)
+
+    # 2. Try local token.json
+    if not creds and TOKEN_FILE.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(
+                str(TOKEN_FILE),
+                SCOPES
+            )
+        except Exception as e:
+            print("Could not load local token:", e)
+
+    # 3. Refresh expired token
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+
+            if TOKEN_FILE.exists():
+                TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
         except Exception as e:
-
             raise Exception(
-                "Unable to load Gmail token from Streamlit Secrets. "
-                "Please check GMAIL_TOKEN_JSON configuration."
-            ) from e
-
-    # 3. Local development fallback
-    elif TOKEN_FILE.exists():
-
-        credentials = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE),
-            SCOPES
-        )
-
-    # 4. Refresh expired credentials
-    if credentials and credentials.expired and credentials.refresh_token:
-
-        credentials.refresh(Request())
-
-        # Save refreshed token locally only
-        if not token_json:
-
-            TOKEN_FILE.write_text(
-                credentials.to_json(),
-                encoding="utf-8"
+                f"Gmail token refresh failed: {e}. "
+                "Check your Streamlit Cloud Gmail token secret."
             )
 
-    # 5. Handle missing or invalid credentials
-    if not credentials or not credentials.valid:
-
-        if token_json:
-
-            raise Exception(
-                "Gmail authentication failed. "
-                "Your Streamlit Gmail token may be expired "
-                "or missing a refresh token. "
-                "Please reauthorize Gmail."
-            )
+    # 4. Local OAuth login if no valid token
+    if not creds or not creds.valid:
 
         if not CREDENTIALS_FILE.exists():
-
             raise FileNotFoundError(
-                "Gmail credentials not configured. "
-                "Please add GMAIL_TOKEN_JSON to Streamlit Secrets."
+                "Gmail credentials.json not found. "
+                "For Streamlit Cloud, configure GMAIL_TOKEN_JSON "
+                "in App Settings > Secrets."
             )
 
-        # Local OAuth login
         flow = InstalledAppFlow.from_client_secrets_file(
             str(CREDENTIALS_FILE),
             SCOPES
         )
 
-        credentials = flow.run_local_server(port=0)
+        creds = flow.run_local_server(port=0)
 
         TOKEN_FILE.write_text(
-            credentials.to_json(),
+            creds.to_json(),
             encoding="utf-8"
         )
 
-    # 6. Connect to Gmail API
-    service = build(
-        "gmail",
-        "v1",
-        credentials=credentials
-    )
+    return build("gmail", "v1", credentials=creds)
 
-    return service
-
-
-# --------------------------------------------------
-# DECODE EMAIL BODY
-# --------------------------------------------------
-
-def decode_body(data):
-
-    if not data:
-        return ""
-
-    try:
-
-        decoded = base64.urlsafe_b64decode(
-            data + "=" * (-len(data) % 4)
-        )
-
-        return decoded.decode(
-            "utf-8",
-            errors="replace"
-        )
-
-    except Exception:
-
-        return ""
-
-
-# --------------------------------------------------
-# EXTRACT EMAIL BODY
-# --------------------------------------------------
 
 def extract_email_body(payload):
+    """Extract readable text from a Gmail message."""
 
-    mime_type = payload.get("mimeType", "")
+    body = ""
 
-    body_data = payload.get(
-        "body", {}
-    ).get("data")
+    if "parts" in payload:
+        for part in payload["parts"]:
+            mime_type = part.get("mimeType", "")
 
-    # Plain text email
-    if mime_type == "text/plain" and body_data:
+            if mime_type == "text/plain":
+                data = part.get("body", {}).get("data")
 
-        return decode_body(body_data)
+                if data:
+                    import base64
+                    body += base64.urlsafe_b64decode(
+                        data + "=="
+                    ).decode("utf-8", errors="ignore")
 
-    # Multipart email
-    parts = payload.get("parts", [])
+            elif "parts" in part:
+                body += extract_email_body(part)
 
-    for part in parts:
+    else:
+        data = payload.get("body", {}).get("data")
 
-        result = extract_email_body(part)
+        if data:
+            import base64
+            body = base64.urlsafe_b64decode(
+                data + "=="
+            ).decode("utf-8", errors="ignore")
 
-        if result:
-            return result
-
-    # HTML fallback
-    if mime_type == "text/html" and body_data:
-
-        return decode_body(body_data)
-
-    return ""
+    return body.strip()
 
 
-# --------------------------------------------------
-# GET EMAIL ADDRESSES FROM CRM LEADS
-# --------------------------------------------------
+def get_message_details(service, message_id):
+    """Get one email's details."""
+
+    message = service.users().messages().get(
+        userId="me",
+        id=message_id,
+        format="full"
+    ).execute()
+
+    headers = message.get("payload", {}).get("headers", [])
+
+    subject = ""
+    sender = ""
+    date = ""
+
+    for header in headers:
+        name = header.get("name", "").lower()
+        value = header.get("value", "")
+
+        if name == "subject":
+            subject = value
+
+        elif name == "from":
+            sender = value
+
+        elif name == "date":
+            date = value
+
+    body = extract_email_body(
+        message.get("payload", {})
+    )
+
+    return {
+        "id": message_id,
+        "sender": sender,
+        "subject": subject,
+        "date": date,
+        "body": body,
+        "snippet": message.get("snippet", "")
+    }
+
+
+def get_recent_emails(max_results=10):
+    """
+    Fetch recent inbox emails.
+    Use only when you explicitly need general inbox messages.
+    """
+
+    service = get_gmail_service()
+
+    results = service.users().messages().list(
+        userId="me",
+        q="in:inbox",
+        maxResults=max_results
+    ).execute()
+
+    messages = results.get("messages", [])
+    emails = []
+
+    for msg in messages:
+        try:
+            email = get_message_details(
+                service,
+                msg["id"]
+            )
+            emails.append(email)
+
+        except Exception as e:
+            print("Could not read email:", e)
+
+    return emails
+
 
 def extract_crm_contacts(leads):
+    """Extract valid email addresses from CRM leads."""
 
     contacts = {}
+
+    if not leads:
+        return contacts
 
     for lead in leads:
 
         if not isinstance(lead, dict):
             continue
 
-        raw_email = str(
-            lead.get("email", "")
-        ).strip()
+        email = str(lead.get("email", "")).strip().lower()
 
-        if not raw_email:
-            continue
-
-        business_name = lead.get(
-            "business_name",
-            "CRM Business"
+        business_name = (
+            lead.get("business_name")
+            or lead.get("name")
+            or "CRM Lead"
         )
 
-        addresses = getaddresses([raw_email])
-
-        for name, address in addresses:
-
-            address = address.strip().lower()
-
-            if re.fullmatch(
-                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                address
-            ):
-
-                contacts[address] = business_name
+        if re.fullmatch(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            email
+        ):
+            contacts[email] = business_name
 
     return contacts
 
 
-# --------------------------------------------------
-# GET COMPLETE EMAIL DETAILS
-# --------------------------------------------------
-
-def get_message_details(service, message_id, business_name):
-
-    details = service.users().messages().get(
-        userId="me",
-        id=message_id,
-        format="full"
-    ).execute()
-
-    payload = details.get("payload", {})
-
-    headers = payload.get("headers", [])
-
-    email_data = {
-        "id": message_id,
-        "thread_id": details.get("threadId", ""),
-        "from": "",
-        "to": "",
-        "subject": "",
-        "date": "",
-        "body": extract_email_body(payload),
-        "business_name": business_name,
-        "internal_date": int(
-            details.get("internalDate", 0)
-        )
-    }
-
-    for header in headers:
-
-        name = header.get("name", "").lower()
-        value = header.get("value", "")
-
-        if name == "from":
-
-            email_data["from"] = value
-
-        elif name == "to":
-
-            email_data["to"] = value
-
-        elif name == "subject":
-
-            email_data["subject"] = value
-
-        elif name == "date":
-
-            email_data["date"] = value
-
-    return email_data
-
-
-# --------------------------------------------------
-# FETCH EMAILS ONLY FROM CRM BUSINESSES
-# --------------------------------------------------
-
-def get_recent_emails_from_leads(leads, max_results=10):
-
+def get_recent_emails_from_leads(leads, max_results=50):
     """
-    Fetch inbox emails only from email addresses
-    saved in the CRM.
+    Fetch Gmail messages ONLY from email addresses saved in CRM.
+
+    This function does not fetch the entire inbox.
     """
 
     contacts = extract_crm_contacts(leads)
@@ -297,92 +239,74 @@ def get_recent_emails_from_leads(leads, max_results=10):
     if not contacts:
         return []
 
-    service = connect_gmail()
+    service = get_gmail_service()
 
-    collected = {}
+    emails = []
+    seen_ids = set()
 
-    per_sender_limit = max(
-        1,
-        min(int(max_results), 100)
-    )
+    # Gmail supports OR searches using braces.
+    addresses = list(contacts.keys())
 
-    for address, business_name in contacts.items():
+    # Keep the search query manageable.
+    for start in range(0, len(addresses), 20):
 
-        query = f"in:inbox from:{address}"
+        batch = addresses[start:start + 20]
+
+        sender_query = " OR ".join(
+            f"from:{address}" for address in batch
+        )
+
+        query = f"in:inbox {{{sender_query}}}"
 
         results = service.users().messages().list(
             userId="me",
-            maxResults=per_sender_limit,
-            q=query
+            q=query,
+            maxResults=max_results
         ).execute()
 
         messages = results.get("messages", [])
 
-        for message in messages:
+        for msg in messages:
 
-            message_id = message["id"]
+            message_id = msg.get("id")
 
-            if message_id in collected:
+            if not message_id or message_id in seen_ids:
                 continue
+
+            seen_ids.add(message_id)
 
             try:
-
-                email_data = get_message_details(
+                email = get_message_details(
                     service,
-                    message_id,
-                    business_name
+                    message_id
                 )
 
-                collected[message_id] = email_data
+                # Match actual sender against CRM addresses.
+                sender_text = email.get("sender", "").lower()
 
-            except Exception:
-                continue
+                matched_email = next(
+                    (
+                        address
+                        for address in batch
+                        if address in sender_text
+                    ),
+                    None
+                )
 
-    # Sort newest emails first
-    emails = sorted(
-        collected.values(),
-        key=lambda item: item.get("internal_date", 0),
-        reverse=True
-    )
+                if not matched_email:
+                    continue
 
-    return emails[:max_results]
+                email["business_name"] = contacts.get(
+                    matched_email,
+                    "CRM Lead"
+                )
 
+                email["crm_email"] = matched_email
 
-# --------------------------------------------------
-# ORIGINAL FUNCTION - GENERAL INBOX EMAILS
-# --------------------------------------------------
+                emails.append(email)
 
-def get_recent_emails(max_results=10):
-
-    """
-    Fetch recent inbox emails without CRM filtering.
-    """
-
-    service = connect_gmail()
-
-    results = service.users().messages().list(
-        userId="me",
-        maxResults=max_results,
-        q="in:inbox"
-    ).execute()
-
-    messages = results.get("messages", [])
-
-    emails = []
-
-    for message in messages:
-
-        try:
-
-            email_data = get_message_details(
-                service,
-                message["id"],
-                "Unknown Business"
-            )
-
-            emails.append(email_data)
-
-        except Exception:
-            continue
+            except Exception as e:
+                print("Could not read CRM email:", e)
 
     return emails
+
